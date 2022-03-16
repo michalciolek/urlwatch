@@ -37,6 +37,7 @@ import subprocess
 import requests
 import textwrap
 import urlwatch
+import cloudscraper
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 from .util import TrackSubClasses
@@ -389,6 +390,147 @@ class UrlJob(Job):
             return str(status_code) in ignored_codes or '%sxx' % (status_code // 100) in ignored_codes
         return False
 
+
+class CloudscraperJob(Job):
+    """Retrieve an URL from a web server using cloudscraper"""
+
+    __kind__ = 'cloudscraper'
+
+    __required__ = ('url',)
+    __optional__ = ('data', 'ssl_no_verify', 'ignore_cached', 'http_proxy', 'https_proxy',
+                    'headers', 'ignore_connection_errors', 'ignore_http_error_codes', 'encoding', 'timeout',
+                    'ignore_timeout_errors', 'ignore_too_many_redirects')
+
+    CHARSET_RE = re.compile('text/(html|plain); charset=([^;]*)')
+
+    def get_location(self):
+        return self.user_visible_url or self.url
+
+    def retrieve(self, job_state):
+        headers = {
+            'User-agent': urlwatch.__user_agent__,
+        }
+
+        proxies = {
+            'http': os.getenv('HTTP_PROXY'),
+            'https': os.getenv('HTTPS_PROXY'),
+        }
+
+        if job_state.etag is not None:
+            headers['If-None-Match'] = job_state.etag
+
+        if job_state.timestamp is not None:
+            headers['If-Modified-Since'] = email.utils.formatdate(job_state.timestamp)
+
+        if self.ignore_cached or job_state.tries > 0:
+            headers['If-None-Match'] = None
+            headers['If-Modified-Since'] = email.utils.formatdate(0)
+            headers['Cache-Control'] = 'max-age=172800'
+            headers['Expires'] = email.utils.formatdate()
+
+        if self.data is not None:
+            if self.method is None:
+                self.method = "POST"
+            headers['Content-type'] = 'application/x-www-form-urlencoded'
+            logger.info('Sending %s request to %s', self.method, self.url)
+
+        if self.http_proxy is not None:
+            proxies['http'] = self.http_proxy
+        if self.https_proxy is not None:
+            proxies['https'] = self.https_proxy
+
+        file_scheme = 'file://'
+        if self.url.startswith(file_scheme):
+            logger.info('Using local filesystem (%s URI scheme)', file_scheme)
+            with open(self.url[len(file_scheme):], 'rt') as f:
+                return f.read()
+
+        if self.headers:
+            self.add_custom_headers(headers)
+
+        if self.timeout is None:
+            # default timeout
+            timeout = 60
+        elif self.timeout == 0:
+            # never timeout
+            timeout = None
+        else:
+            timeout = self.timeout
+
+        scraper = cloudscraper.create_scraper()
+        response = scraper.get(url=self.url,
+                                    data=self.data,
+                                    headers=headers,
+                                    verify=(not self.ssl_no_verify),
+                                    proxies=proxies,
+                                    timeout=timeout)
+
+        response.raise_for_status()
+        if response.status_code == requests.codes.not_modified:
+            raise NotModifiedError()
+
+        # Save ETag from response into job_state, which will be saved in cache
+        job_state.etag = response.headers.get('ETag')
+
+        if FilterBase.filter_chain_needs_bytes(self.filter):
+            return response.content
+
+        # If we can't find the encoding in the headers, requests gets all
+        # old-RFC-y and assumes ISO-8859-1 instead of UTF-8. Use the old
+        # urlwatch behavior and try UTF-8 decoding first.
+        content_type = response.headers.get('Content-type', '')
+        content_type_match = self.CHARSET_RE.match(content_type)
+        if not content_type_match and not self.encoding:
+            try:
+                try:
+                    try:
+                        return response.content.decode('utf-8')
+                    except UnicodeDecodeError:
+                        return response.content.decode('latin1')
+                except UnicodeDecodeError:
+                    return response.content.decode('utf-8', 'ignore')
+            except LookupError:
+                # If this is an invalid encoding, decode as ascii (Debian bug 731931)
+                return response.content.decode('ascii', 'ignore')
+        if self.encoding:
+            response.encoding = self.encoding
+
+        return response.text
+
+    def add_custom_headers(self, headers):
+        """
+        Adds custom request headers from the job list (URLs) to the pre-filled dictionary `headers`.
+        Pre-filled values of conflicting header keys (case-insensitive) are overwritten by custom value.
+        """
+        headers_to_remove = [x for x in headers if x.lower() in [y.lower() for y in self.headers]]
+        for header in headers_to_remove:
+            headers.pop(header, None)
+        headers.update(self.headers)
+
+    def format_error(self, exception, tb):
+        if isinstance(exception, requests.exceptions.RequestException):
+            # Instead of a full traceback, just show the HTTP error
+            return str(exception)
+        return tb
+
+    def ignore_error(self, exception):
+        if isinstance(exception, requests.exceptions.ConnectionError) and self.ignore_connection_errors:
+            return True
+        if isinstance(exception, requests.exceptions.Timeout) and self.ignore_timeout_errors:
+            return True
+        if isinstance(exception, requests.exceptions.TooManyRedirects) and self.ignore_too_many_redirects:
+            return True
+        elif isinstance(exception, requests.exceptions.HTTPError):
+            status_code = exception.response.status_code
+            ignored_codes = []
+            if isinstance(self.ignore_http_error_codes, int) and self.ignore_http_error_codes == status_code:
+                return True
+            elif isinstance(self.ignore_http_error_codes, str):
+                ignored_codes = [s.strip().lower() for s in self.ignore_http_error_codes.split(',')]
+            elif isinstance(self.ignore_http_error_codes, list):
+                ignored_codes = [str(s).strip().lower() for s in self.ignore_http_error_codes]
+            return str(status_code) in ignored_codes or '%sxx' % (status_code // 100) in ignored_codes
+        return False
 
 class BrowserJob(Job):
     """Retrieve an URL, emulating a real web browser"""
